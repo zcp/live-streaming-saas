@@ -645,10 +645,12 @@ class M3U8Downloader:
 
                 # 提交所有下载任务
                 for i, ts_url in enumerate(ts_urls[:7]):
-                    ts_filename = os.path.join(ts_dir, f'segment_{i:04d}.ts')
+                    #ts_filename = os.path.join(ts_dir, f'segment_{i:06d}.ts')
+                    original_filename = os.path.basename(ts_url)
+                    ts_filename = os.path.join(ts_dir, original_filename)
                     future = executor.submit(self.download_and_verify_ts_segment, ts_url, ts_filename, headers, i)
                     futures.append((i, ts_url, future))
-                print("1")
+
                 # 等待所有下载完成，同时监控线程健康状态
                 while futures:
                     # 检查失败数量是否超过限制
@@ -682,10 +684,13 @@ class M3U8Downloader:
                                 # 取消旧的future
                                 future.cancel()
                                 # 创建新的下载任务
+                                original_filename = os.path.basename(ts_url)
+                                ts_filename = os.path.join(ts_dir, original_filename)
+
                                 new_future = executor.submit(
                                     self.download_and_verify_ts_segment,
                                     ts_url,
-                                    os.path.join(ts_dir, f'segment_{i:04d}.ts'),
+                                    ts_filename,
                                     headers,
                                     i
                                 )
@@ -740,6 +745,10 @@ class M3U8Downloader:
                 # 更新下载结束时间
                 result["download_end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
+                # 下载完成后，修改m3u8文件
+                if result["success"]:
+                    self.modify_m3u8_for_local_playback(m3u8_filename, ts_dir, ts_urls)
+
                 # 检查是否有失败的片段
                 if result["failed_ts_segments"]:
                     result["success"] = False
@@ -774,7 +783,62 @@ class M3U8Downloader:
             result["download_end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
             return result
 
+    def modify_m3u8_for_local_playback(self, m3u8_filename, ts_dir, ts_urls):
+        """
+        修改m3u8文件以便本地播放，并保存到新文件
 
+        Args:
+            m3u8_filename (str): 原始m3u8文件路径
+            ts_dir (str): ts文件所在目录
+            ts_urls (list): 原始ts文件URL列表，用于保持顺序
+        """
+        try:
+            # 读取原始m3u8文件
+            with open(m3u8_filename, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # 按行分割
+            lines = content.split('\n')
+            modified_lines = []
+
+            # 用于追踪ts文件URL的索引
+            ts_index = 0
+
+            for line in lines:
+                if line.endswith('.ts'):
+                    # 获取当前ts文件的原始URL
+                    original_url = ts_urls[ts_index]
+                    # 从URL中提取文件名
+                    original_filename = os.path.basename(original_url)
+                    # 检查本地文件是否存在
+                    local_ts_path = os.path.join(ts_dir, original_filename)
+                    if os.path.exists(local_ts_path):
+                        # 如果文件存在，使用本地路径
+                        local_path = f'ts/{original_filename}'
+                        modified_lines.append(local_path)
+                    else:
+                        # 如果文件不存在，保持原始URL
+                        modified_lines.append(line)
+                    ts_index += 1
+                else:
+                    modified_lines.append(line)
+
+            # 创建新的m3u8文件名
+            dir_name = os.path.dirname(m3u8_filename)
+            base_name = os.path.basename(m3u8_filename)
+            name, ext = os.path.splitext(base_name)
+            new_m3u8_filename = os.path.join(dir_name, f'{name}_local{ext}')
+
+            # 写入修改后的内容到新文件
+            with open(new_m3u8_filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(modified_lines))
+
+            self.logger.info(f"已创建本地播放的m3u8文件: {new_m3u8_filename}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"修改m3u8文件时出错: {str(e)}")
+            return False
     def process_data(self, data, token):
         """处理输入数据(一个直播间的视频和图像)，下载视频和图片"""
         try:
@@ -1114,7 +1178,9 @@ class M3U8Downloader:
                                     segment_index = ts_info.get('segment_index')
                                     self.logger.info(f"处理ts片段: URL={ts_url}, segment_index={segment_index}")
                                     if ts_url and segment_index is not None:
-                                        ts_filename = os.path.join(ts_dir, f'segment_{segment_index:04d}.ts')
+                                        original_filename = os.path.basename(ts_url)
+                                        ts_filename = os.path.join(ts_dir, original_filename)
+                                        #ts_filename = os.path.join(ts_dir, f'segment_{segment_index:06d}.ts')
                                         future = executor.submit(self.download_and_verify_ts_segment, ts_url, ts_filename, headers, segment_index)
                                         futures.append((ts_info, future))
 
@@ -1138,6 +1204,43 @@ class M3U8Downloader:
                                 record['failed_m3u8'] = None
                                 self.logger.info("所有ts片段下载成功")
                                 self.logger.info(f"成功重新下载m3u8: {url}")
+
+                                # 获取ts目录下的所有ts文件
+                                ts_files = [f for f in os.listdir(ts_dir) if f.endswith('.ts')]
+                                # 按文件名排序
+                                ts_files.sort()
+
+                                # 修改m3u8文件以支持本地播放
+                                m3u8_filename = os.path.join(video_dir, 'playlist.m3u8')
+                                if os.path.exists(m3u8_filename):
+                                    new_m3u8_filename = os.path.join(video_dir, 'playlist_local.m3u8')
+
+                                    with open(m3u8_filename, 'r', encoding='utf-8') as f:
+                                        m3u8_content = f.readlines()
+
+                                    # 创建新的m3u8内容
+                                    new_m3u8_content = []
+                                    for line in m3u8_content:
+                                        if line.strip().endswith('.ts'):
+                                            # 找到对应的ts文件
+                                            ts_name = os.path.basename(line.strip())
+                                            if ts_name in ts_files:
+                                                # 使用相对路径指向本地ts文件
+                                                new_m3u8_content.append(f'ts/{ts_name}\n')
+                                            else:
+                                                # 如果本地没有对应的ts文件，保持原始URL
+                                                new_m3u8_content.append(line)
+                                        else:
+                                            # 保持其他行不变
+                                            new_m3u8_content.append(line)
+
+                                    # 写入新的m3u8文件
+                                    with open(new_m3u8_filename, 'w', encoding='utf-8') as f:
+                                        f.writelines(new_m3u8_content)
+
+                                    self.logger.info(f"已更新m3u8文件以支持本地播放: {new_m3u8_filename}")
+                                else:
+                                    self.logger.error(f"找不到m3u8文件: {m3u8_filename}")
                             else:
                                 self.logger.error(f"仍有 {len(failed_m3u8['failed_ts_segments'])} 个ts片段下载失败")
                         else:
@@ -1211,8 +1314,8 @@ def main():
     # parser_main()
 
     # 创建下载器实例
-    downloader = M3U8Downloader('D:\\duanshu\\downloaded_media',"download_for_error_logs")
-    #downloader = M3U8Downloader('D:\\duanshu\\downloaded_media')
+    #downloader = M3U8Downloader('D:\\duanshu\\downloaded_media',"download_for_error_logs")
+    downloader = M3U8Downloader('D:\\duanshu\\downloaded_media')
     # 处理文件
     start_time = time.time()
     file_path = 'liveroomlist_inc_vzan.csv'  # 替换为您的输入文件路径
