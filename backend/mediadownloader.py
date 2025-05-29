@@ -1,6 +1,9 @@
 import json
 import os
+import random
 import threading
+import uuid
+from platform import libc_ver
 
 import requests
 from urllib.parse import urlparse, urljoin
@@ -12,13 +15,62 @@ import concurrent.futures
 from pycparser.ply.yacc import token
 
 
+def generate_standard_filename(resource_type, liveroom_id, operation_type, extension, segment_index=None):
+    """
+    生成标准格式的文件名
+
+    Args:
+        resource_type (str): 资源类型 (video/cover/snapshot)
+        liveroom_id (str): 直播间ID，如果长度超过8位，将只取后8位
+        operation_type (str): 操作类型 (upload/transcoded/fetch)
+        extension (str): 文件扩展名
+
+    Returns:
+        str: 标准格式的文件名，格式为：
+            {resource_type}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}
+
+    Note:
+        - timestamp: ISO格式时间戳，格式为YYYYMMDDThhmmss，例如：20240328T153000
+        - random_hash: 8位随机十六进制数，用于确保文件名唯一性
+        - 如果生成的文件名超过255个字符，将自动截断并保留扩展名
+    """
+    # 处理resource_id，如果长度超过8位，只取后8位
+    if len(liveroom_id) > 8:
+        resource_id = liveroom_id[-8:]
+
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    # 增加随机数长度到8位，确保唯一性
+    random_hash = str(uuid.uuid4()).replace('-', '')[:8]  # 去掉连字符后取前8位
+
+    # 生成文件名
+    if segment_index is not None and resource_type == 'video' and extension == '.ts':
+        # ts文件使用新的命名格式
+        filename = f"segment_{segment_index:06d}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}"
+    else:
+        # 其他文件使用标准格式
+        filename = f"{resource_type}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}"
+
+    # 如果文件名总长度超过255个字符（Windows文件系统限制），进行截断
+    if len(filename) > 255:
+        # 保留扩展名
+        ext_len = len(extension)
+        # 计算需要保留的其他部分长度
+        remaining_len = 255 - ext_len
+        # 截断文件名，保留扩展名
+        filename = filename[:remaining_len] + extension
+
+    return filename
+
+
 class M3U8Downloader:
-    def __init__(self, save_dir, flag = 'inc_download'):
+    def __init__(self, save_dir, content_id = None, flag = 'inc_download'):
         """初始化下载器"""
         self.save_dir = save_dir
+        self.contend_id = content_id
         self.chunk_size = 1024 * 1024  # 1MB
         self.max_retries = 3
         self.thread_timeout = 30  # 线程超时时间（秒）
+        self.download_timeout = 300  # 下载任务总超时时间（秒）
         self.timeout = 30
         self.maximum_error_ts = 2
 
@@ -48,6 +100,7 @@ class M3U8Downloader:
         #如果是处理错误下载，则不需要抽取extract_m3u8_url去判断是否已经下载了。
         else:
             self.downloaded_urls = []
+
     def extract_m3u8_url(self):
         """从CSV文件中提取包含m3u8的直播间ID
 
@@ -318,7 +371,7 @@ class M3U8Downloader:
 
         return dead_threads
 
-    def download_vzan_image(self, image_url, save_dir, authorization, image_name=None):
+    def download_vzan_image(self, image_url, resource_type, save_dir, authorization, image_name=None):
             """
             专门用于下载微赞图片的函数
 
@@ -341,18 +394,21 @@ class M3U8Downloader:
                     return False
                 # 从URL中提取文件名
 
-                filename = os.path.basename(urlparse(image_url).path)
-                if not filename:
-                    filename = f"image_{int(time.time())}.jpg"
+                # 从URL中提取扩展名
+                extension = os.path.splitext(urlparse(image_url).path)[1]
+                if not extension:
+                    extension = '.jpg'
 
-                # 确保保存目录存在
+                # 生成标准文件名
+                #content_id = os.path.basename(save_dir)
+                filename = generate_standard_filename(resource_type, self.content_id, 'fetch', extension)
 
-                # 构建保存路径
-                save_path = os.path.join(save_dir, 'images', filename)
+                save_path = os.path.join(save_dir, filename)
+
                 try:
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 except Exception as e:
-                    self.logger.error(f"创建保存目录失败: {str(e)}")
+                    self.logger.error(f"创建保存图片文件失败: {str(e)}")
                     return False
 
                 # 设置请求头
@@ -428,21 +484,32 @@ class M3U8Downloader:
                 return False
 
 
-    def download_duanshu_image(self, url, save_dir, authorization=None):
+    def download_duanshu_image(self, url, resource_type, save_dir, authorization=None):
         """下载图片，使用简单重试机制"""
         try:
-            # 从URL中提取文件名
-            filename = os.path.basename(urlparse(url).path)
-            if not filename:
-                filename = f"image_{int(time.time())}.jpg"
+            self.logger.info(f"开始下载短书图片: {url}")
+            # 检查URL是否为空
+            if not url or not url.strip():
+                self.logger.error("图片URL为空")
+                return False
 
-            # 构建保存路径
-            if save_dir is None:
-                save_dir = self.save_dir
-            save_path = os.path.join(save_dir, 'images', filename)
+            # 从URL中提取扩展名
+            extension = os.path.splitext(urlparse(url).path)[1]
+            if not extension:
+                extension = '.jpg'
 
-            # 确保图片保存目录存在
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            # 生成标准文件名
+            #content_id = os.path.basename(save_dir)
+            filename = generate_standard_filename(resource_type, self.content_id, 'fetch', extension)
+
+
+            save_path = os.path.join(save_dir, filename)
+
+            try:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            except Exception as e:
+                self.logger.error(f"创建保存图片文件失败: {str(e)}")
+                return False
 
             # 添加请求头
             headers = {
@@ -494,11 +561,41 @@ class M3U8Downloader:
             self.logger.error(f"下载图片时出错: {str(e)}")
             return False
 
-    def download_image(self,url, save_dir, authorization):
-        if "duanshu" in url:
-            return self.download_duanshu_image(url, save_dir)
-        if "vzan" in url:
-            return self.download_vzan_image(url, save_dir,authorization)
+    def download_image(self, url, save_dir, authorization):
+        """下载图片的统一入口
+
+        Args:
+            url (str): 图片URL
+            save_dir (str): 保存目录
+            authorization (str): 授权token
+
+        Returns:
+            bool: 下载是否成功
+        """
+        try:
+            if not url or not url.strip():
+                self.logger.error("图片URL为空")
+                return False
+
+            # 创建图片保存目录，与videos目录同级
+            images_dir = os.path.join(save_dir, 'images')
+            try:
+                os.makedirs(images_dir, exist_ok=True)
+                self.logger.info(f"创建图片保存目录: {images_dir}")
+            except Exception as e:
+                self.logger.error(f"创建图片保存目录失败: {str(e)}")
+                return False
+
+            if "duanshu" in url:
+                return self.download_duanshu_image(url, 'image', images_dir, authorization)
+            elif "vzan" in url:
+                return self.download_vzan_image(url, 'image', images_dir, authorization)
+            else:
+                self.logger.error(f"不支持的图片URL类型: {url}")
+                return False
+        except Exception as e:
+            self.logger.error(f"下载图片时出错: {str(e)}")
+            return False
 
     def download_and_verify_ts_segment(self, url, filename, headers, index):
         """
@@ -560,6 +657,120 @@ class M3U8Downloader:
         except Exception as e:
             return False
 
+    def get_video_info_from_ts(self, ts_file_path):
+        """
+        从ts片段中获取视频信息
+
+        Args:
+            ts_file_path (str): ts文件路径
+
+        Returns:
+            dict: 包含视频信息的字典
+            {
+                'resolution': (width, height),
+                'bandwidth': int,  # 码率，单位bps
+                'codec': str,      # 视频编码
+                'frame_rate': float # 帧率
+            }
+        """
+        try:
+            import subprocess
+            import json
+
+            # 使用ffprobe获取视频信息
+            cmd = [
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                ts_file_path
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.error(f"ffprobe执行失败: {result.stderr}")
+                return None
+
+            # 解析ffprobe输出
+            info = json.loads(result.stdout)
+            video_info = {
+                'resolution': None,
+                'bandwidth': None,
+                'codec': None,
+                'frame_rate': None
+            }
+
+            # 查找视频流信息
+            for stream in info.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    # 获取分辨率
+                    width = stream.get('width')
+                    height = stream.get('height')
+                    if width and height:
+                        video_info['resolution'] = (width, height)
+
+                    # 获取编码
+                    video_info['codec'] = stream.get('codec_name')
+
+                    # 获取帧率
+                    if 'r_frame_rate' in stream:
+                        num, den = map(int, stream['r_frame_rate'].split('/'))
+                        if den != 0:
+                            video_info['frame_rate'] = num / den
+
+            # 获取码率
+            format_info = info.get('format', {})
+            if 'bit_rate' in format_info:
+                video_info['bandwidth'] = int(format_info['bit_rate'])
+
+            return video_info
+
+        except Exception as e:
+            self.logger.error(f"从ts文件获取视频信息时出错: {str(e)}")
+            return None
+
+    def rename_hls_folder(self, video_dir, video_info):
+        """
+        根据视频信息重命名hls文件夹
+
+        Args:
+            video_dir (str): 视频目录路径
+            video_info (dict): 视频信息字典
+
+        Returns:
+            str: 新的hls文件夹路径
+        """
+        try:
+            if not video_info or not video_info['resolution'] or not video_info['bandwidth']:
+                self.logger.warning("无法获取完整的视频信息，使用默认文件夹名")
+                return video_dir
+
+            # 获取分辨率和码率
+            width, height = video_info['resolution']
+            bandwidth = video_info['bandwidth']
+
+            # 将码率转换为kbps
+            bandwidth_kbps = bandwidth // 1000
+
+            # 创建新的文件夹名
+            new_folder_name = f"{height}p_{bandwidth_kbps}kbps"
+            new_video_dir = os.path.join(os.path.dirname(video_dir), new_folder_name)
+
+            # 如果新文件夹已存在，添加时间戳
+            if os.path.exists(new_video_dir):
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                new_video_dir = f"{new_video_dir}_{timestamp}"
+
+            # 重命名文件夹
+            os.rename(video_dir, new_video_dir)
+            self.logger.info(f"重命名hls文件夹: {video_dir} -> {new_video_dir}")
+
+            return new_video_dir
+
+        except Exception as e:
+            self.logger.error(f"重命名hls文件夹时出错: {str(e)}")
+            return video_dir
 
     def download_m3u8(self, url, save_dir=None):
         # 初始化结果
@@ -581,12 +792,17 @@ class M3U8Downloader:
                 save_dir = self.save_dir
 
             # 创建视频保存目录
-            video_dir = os.path.join(save_dir, 'videos')
+            video_dir = os.path.join(save_dir, 'hls')
             os.makedirs(video_dir, exist_ok=True)
             self.logger.info(f"视频文件将保存在: {video_dir}")
 
             # 下载m3u8文件
-            m3u8_filename = os.path.join(video_dir, 'playlist.m3u8')
+            #m3u8_filename = os.path.join(video_dir, 'playlist.m3u8')
+            #self.logger.info(f"开始下载m3u8文件: {url}")
+            # 生成标准m3u8文件名
+            #content_id = os.path.basename(save_dir)
+            standard_filename = generate_standard_filename('video', self.content_id, 'fetch', '.m3u8')
+            m3u8_filename = os.path.join(video_dir, standard_filename)
             self.logger.info(f"开始下载m3u8文件: {url}")
 
             # 模拟VLC的请求头
@@ -638,6 +854,8 @@ class M3U8Downloader:
             ts_dir = os.path.join(video_dir, 'ts')
             os.makedirs(ts_dir, exist_ok=True)
 
+            # 创建ts文件名映射
+            ts_mapping = {}
             # 使用线程池并发下载ts片段
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = []
@@ -647,9 +865,13 @@ class M3U8Downloader:
                 for i, ts_url in enumerate(ts_urls[:7]):
                     #ts_filename = os.path.join(ts_dir, f'segment_{i:06d}.ts')
                     original_filename = os.path.basename(ts_url)
-                    ts_filename = os.path.join(ts_dir, original_filename)
+                    standard_filename = generate_standard_filename('video', self.content_id, 'fetch', '.ts', segment_index=i)
+                    # 保存映射关系
+                    ts_mapping[original_filename] = standard_filename
+
+                    ts_filename = os.path.join(ts_dir, standard_filename)
                     future = executor.submit(self.download_and_verify_ts_segment, ts_url, ts_filename, headers, i)
-                    futures.append((i, ts_url, future))
+                    futures.append((i, ts_url, future,i))
 
                 # 等待所有下载完成，同时监控线程健康状态
                 while futures:
@@ -658,7 +880,7 @@ class M3U8Downloader:
                         print("2-1")
                         self.logger.error(f'失败片段数量超过{self.maximum_error_ts}个，停止当前视频下载')
                         # 取消所有未完成的下载任务
-                        for _, _, future in futures:
+                        for _, _, future, i in futures:
                             future.cancel()
                         # 更新结果
                         futures.clear()
@@ -678,14 +900,20 @@ class M3U8Downloader:
                                 current_time - status.get("last_active", status["start_time"]) > 30):
                             self.logger.warning(f"发现僵死线程 {thread_id}，正在重启")
                             # 找到对应的future
-                            for idx, (i, ts_url, future) in enumerate(futures):
+                            for idx, (i, ts_url, future,segment_index) in enumerate(futures):
                                 if future.done():
                                     continue
                                 # 取消旧的future
                                 future.cancel()
                                 # 创建新的下载任务
                                 original_filename = os.path.basename(ts_url)
-                                ts_filename = os.path.join(ts_dir, original_filename)
+                                try:
+                                    standard_filename = ts_mapping[original_filename]
+                                except KeyError:
+                                    # 如果获取不到映射，使用保存的segment_index重新生成
+                                    standard_filename = generate_standard_filename('video', self.content_id, 'fetch',
+                                                                                   '.ts', segment_index=segment_index)
+                                ts_filename = os.path.join(ts_dir, standard_filename)
 
                                 new_future = executor.submit(
                                     self.download_and_verify_ts_segment,
@@ -694,11 +922,11 @@ class M3U8Downloader:
                                     headers,
                                     i
                                 )
-                                futures[idx] = (i, ts_url, new_future)
+                                futures[idx] = (i, ts_url, new_future, segment_index)
                                 break
 
                     # 检查已完成的future
-                    for i, ts_url, future in futures[:]:
+                    for i, ts_url, future, segment_index in futures[:]:
                         try:
                             if future.done():
                                 if not future.result():
@@ -714,7 +942,7 @@ class M3U8Downloader:
                                     result["failed_segments"] += 1
                                 else:
                                     result["successful_segments"] += 1
-                                futures.remove((i, ts_url, future))
+                                futures.remove((i, ts_url, future, segment_index))
                         except concurrent.futures.TimeoutError:
                             self.logger.error(f"TS片段 {i} 下载超时: {ts_url}")
                             result["failed_ts_segments"].append({
@@ -726,7 +954,7 @@ class M3U8Downloader:
                                 "retry_count": 0
                             })
                             result["failed_segments"] += 1
-                            futures.remove((i, ts_url, future))
+                            futures.remove((i, ts_url, future,segment_index))
                         except Exception as e:
                             self.logger.error(f"TS片段 {i} 下载出错: {str(e)}")
                             result["failed_ts_segments"].append({
@@ -738,16 +966,24 @@ class M3U8Downloader:
                                 "retry_count": 0
                             })
                             result["failed_segments"] += 1
-                            futures.remove((i, ts_url, future))
+                            futures.remove((i, ts_url, future,segment_index))
 
                     time.sleep(1)
 
                 # 更新下载结束时间
                 result["download_end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
+                # 保存ts文件名映射
+                mapping_file = os.path.join(video_dir, 'ts_mapping.json')
+                with open(mapping_file, 'w', encoding='utf-8') as f:
+                    json.dump(ts_mapping, f, ensure_ascii=False, indent=2)
+                self.logger.info(f"已保存ts文件名映射到: {mapping_file}")
+
                 # 下载完成后，修改m3u8文件
                 if result["success"]:
-                    self.modify_m3u8_for_local_playback(m3u8_filename, ts_dir, ts_urls)
+                    self.modify_m3u8_for_local_playback(m3u8_filename, ts_dir, ts_urls, ts_mapping=ts_mapping)
+
+
 
                 # 检查是否有失败的片段
                 if result["failed_ts_segments"]:
@@ -763,8 +999,6 @@ class M3U8Downloader:
                     self.logger.info(f"下载统计: 总数={result['total_segments']}, "
                                      f"成功={result['successful_segments']}, "
                                      f"失败={result['failed_segments']}")
-
-
 
                 return result
 
@@ -783,16 +1017,32 @@ class M3U8Downloader:
             result["download_end_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
             return result
 
-    def modify_m3u8_for_local_playback(self, m3u8_filename, ts_dir, ts_urls):
+    def modify_m3u8_for_local_playback(self, m3u8_filename, ts_dir, ts_urls, ts_mapping=None, create_new_file=True):
         """
-        修改m3u8文件以便本地播放，并保存到新文件
+        修改m3u8文件以便本地播放，使用ts_mapping.json中的映射关系
 
         Args:
             m3u8_filename (str): 原始m3u8文件路径
             ts_dir (str): ts文件所在目录
-            ts_urls (list): 原始ts文件URL列表，用于保持顺序
+            ts_urls (list): 新下载的ts文件URL列表
+            ts_mapping (dict, optional): ts文件名映射关系
+            create_new_file (bool): 是否创建新的m3u8文件，默认为True
         """
         try:
+            if ts_mapping is None:
+                # 读取ts_mapping.json文件，与m3u8文件在同一目录
+                video_dir = os.path.dirname(m3u8_filename)  # 获取videos目录
+                mapping_file = os.path.join(video_dir, 'ts_mapping.json')
+                if not os.path.exists(mapping_file):
+                    self.logger.error(f"找不到ts_mapping.json文件: {mapping_file}")
+                    return False
+
+                with open(mapping_file, 'r', encoding='utf-8') as f:
+                    ts_mapping = json.load(f)
+
+            # 创建一个新下载ts文件的集合，用于快速查找
+            new_downloaded_ts = {os.path.basename(url) for url in ts_urls}
+
             # 读取原始m3u8文件
             with open(m3u8_filename, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -800,45 +1050,61 @@ class M3U8Downloader:
             # 按行分割
             lines = content.split('\n')
             modified_lines = []
-
-            # 用于追踪ts文件URL的索引
-            ts_index = 0
+            ts_count = 0  # 用于跟踪ts片段的顺序
 
             for line in lines:
                 if line.endswith('.ts'):
-                    # 获取当前ts文件的原始URL
-                    original_url = ts_urls[ts_index]
                     # 从URL中提取文件名
-                    original_filename = os.path.basename(original_url)
-                    # 检查本地文件是否存在
-                    local_ts_path = os.path.join(ts_dir, original_filename)
-                    if os.path.exists(local_ts_path):
-                        # 如果文件存在，使用本地路径
-                        local_path = f'ts/{original_filename}'
-                        modified_lines.append(local_path)
+                    original_filename = os.path.basename(line.strip())
+
+                    # 检查这个文件是否在新下载的ts文件中
+                    if original_filename in new_downloaded_ts and original_filename in ts_mapping:
+                        standard_filename = ts_mapping[original_filename]
+                        # 检查本地文件是否存在
+                        local_ts_path = os.path.join(ts_dir, standard_filename)
+                        if os.path.exists(local_ts_path):
+                            # 使用标准文件名作为本地路径
+                            local_path = f'ts/{standard_filename}'
+                            modified_lines.append(local_path)
+                            self.logger.info(
+                                f"替换第 {ts_count} 个ts片段: {original_filename} -> {standard_filename}")
+                        else:
+                            # 如果本地文件不存在，保持原始URL
+                            modified_lines.append(line)
+                            self.logger.warning(f"第 {ts_count} 个ts片段本地文件不存在: {standard_filename}")
                     else:
-                        # 如果文件不存在，保持原始URL
+                        # 如果不在新下载的列表中或找不到映射，保持原始URL
                         modified_lines.append(line)
-                    ts_index += 1
+                        #if original_filename not in new_downloaded_ts:
+                        #    self.logger.info(f"第 {ts_count + 1} 个ts片段未重新下载: {original_filename}")
+                        #if original_filename not in ts_mapping:
+                        #    self.logger.warning(f"第 {ts_count + 1} 个ts片段找不到映射: {original_filename}")
+
+                    ts_count += 1
                 else:
                     modified_lines.append(line)
 
-            # 创建新的m3u8文件名
-            dir_name = os.path.dirname(m3u8_filename)
-            base_name = os.path.basename(m3u8_filename)
-            name, ext = os.path.splitext(base_name)
-            new_m3u8_filename = os.path.join(dir_name, f'{name}_local{ext}')
+            # 根据create_new_file参数决定是创建新文件还是覆盖原文件
+            if create_new_file:
+                # 创建新的m3u8文件名
+                dir_name = os.path.dirname(m3u8_filename)
+                new_m3u8_filename = os.path.join(dir_name,
+                                                 generate_standard_filename('video', self.content_id, 'local', '.m3u8'))
+            else:
+                new_m3u8_filename = m3u8_filename
 
-            # 写入修改后的内容到新文件
+            # 写入修改后的内容到文件
             with open(new_m3u8_filename, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(modified_lines))
 
-            self.logger.info(f"已创建本地播放的m3u8文件: {new_m3u8_filename}")
+            self.logger.info(f"已{'创建' if create_new_file else '更新'}本地播放的m3u8文件: {new_m3u8_filename}")
+            self.logger.info(f"共处理 {ts_count} 个ts片段")
             return True
 
         except Exception as e:
             self.logger.error(f"修改m3u8文件时出错: {str(e)}")
             return False
+
     def process_data(self, data, token):
         """处理输入数据(一个直播间的视频和图像)，下载视频和图片"""
         try:
@@ -848,11 +1114,39 @@ class M3U8Downloader:
                 self.logger.error("数据格式错误")
                 return False
 
-            content_id = fields[0]  # 获取ID
-            self.logger.info(f"处理内容ID: {content_id}")
+            #content_id = fields[0]  # 获取ID
+            # 获取content_id并进行异常处理
+            try:
+                self.content_id = fields[0]
+                if not self.content_id or not self.content_id.strip():
+                    raise ValueError("content_id为空")
+            except (IndexError, ValueError) as e:
+                error_msg = f"无法获取content_id: {str(e)}"
+                self.logger.error(error_msg)
+                # 记录错误到错误日志
+                error_record = {
+                    "content_id": None,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "failed_images": [],
+                    "failed_m3u8": {
+                        "url": None,
+                        "error": error_msg,
+                        "failed_ts_segments": [],
+                        "total_ts_segments": 0
+                    },
+                    "total_ts_segments": 0
+                }
+                with open(self.error_log_file, 'a', encoding='utf-8') as f:
+                    if os.path.getsize(self.error_log_file) == 0:
+                        f.write(json.dumps(error_record, ensure_ascii=False))
+                    else:
+                        f.write('\n' + json.dumps(error_record, ensure_ascii=False))
+                return False
+
+            self.logger.info(f"处理内容ID: {self.content_id}")
 
             # 创建以ID命名的目录，使用短路径
-            content_dir = os.path.join(self.save_dir, content_id)  # 只使用ID的前8位
+            content_dir = os.path.join(self.save_dir, self.content_id)  # 只使用ID的前8位
             os.makedirs(content_dir, exist_ok=True)
             self.logger.info(f"创建内容目录: {content_dir}")
 
@@ -860,7 +1154,7 @@ class M3U8Downloader:
 
             # 初始化错误记录
             error_record = {
-                "content_id": content_id,
+                "content_id": self.content_id,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "failed_images": [],
                 "failed_m3u8": None,
@@ -915,15 +1209,14 @@ class M3U8Downloader:
                         success_flag = False
 
                 if success_flag:
-                    content_id = os.path.basename(content_dir)
                     successful_download = {
-                            "content_id": content_id,
+                            "content_id": self.content_id,
                             "url": '$$$$$'.join(str(x) for x in image_urls) if image_urls else "",
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
                     self.successful_downloads.append(successful_download)
                     self.save_successful_downloads()
-                    self.logger.info(f"已记录成功下载的images: {image_urls} (直播间ID: {content_id})")
+                    self.logger.info(f"已记录成功下载的images: {image_urls} (直播间ID: {self.content_id})")
 
 
             # 下载视频
@@ -931,7 +1224,7 @@ class M3U8Downloader:
                 self.logger.info(f"开始下载视频: {video_url}")
                 try:
                     # 使用content_dir而不是self.save_dir
-                    content_id = os.path.basename(content_dir)
+                    #content_id = os.path.basename(content_dir)
                     #print(content_id,self.downloaded_content_ids)
                     #if content_id in self.downloaded_content_ids:
                     if video_url in self.downloaded_urls:
@@ -942,13 +1235,13 @@ class M3U8Downloader:
                         # 记录成功下载的m3u8信息
 
                         successful_download = {
-                            "content_id": content_id,
+                            "content_id": self.content_id,
                             "url": video_url,
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                         }
                         self.successful_downloads.append(successful_download)
                         self.save_successful_downloads()
-                        self.logger.info(f"已记录成功下载的m3u8: {video_url} (直播间ID: {content_id})")
+                        self.logger.info(f"已记录成功下载的m3u8: {video_url} (直播间ID: {self.content_id})")
                     else:
                         error_record["failed_m3u8"] = {
                             "url": video_url,
@@ -1105,14 +1398,14 @@ class M3U8Downloader:
 
             # 处理每条错误记录
             for record in error_records:
-                content_id = record.get('content_id')
-                if not content_id:
+                self.content_id = record.get('content_id')
+                if not self.content_id:
                     continue
 
-                self.logger.info(f"处理内容ID: {content_id}")
+                self.logger.info(f"处理内容ID: {self.content_id}")
 
                 # 创建内容目录
-                content_dir = os.path.join(self.save_dir, content_id)
+                content_dir = os.path.join(self.save_dir, self.content_id)
                 os.makedirs(content_dir, exist_ok=True)
 
                 # 处理失败的图片
@@ -1150,7 +1443,7 @@ class M3U8Downloader:
                             success_ts = []
 
                             # 创建ts文件保存目录
-                            video_dir = os.path.join(content_dir, 'videos')
+                            video_dir = os.path.join(content_dir, 'hls')
                             ts_dir = os.path.join(video_dir, 'ts')
                             os.makedirs(ts_dir, exist_ok=True)
 
@@ -1173,19 +1466,29 @@ class M3U8Downloader:
                             with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                                 futures = []
 
+                                ts_mapping = {}
+
                                 for ts_info in failed_ts_segments:
                                     ts_url = ts_info.get('url')
                                     segment_index = ts_info.get('segment_index')
                                     self.logger.info(f"处理ts片段: URL={ts_url}, segment_index={segment_index}")
                                     if ts_url and segment_index is not None:
                                         original_filename = os.path.basename(ts_url)
-                                        ts_filename = os.path.join(ts_dir, original_filename)
-                                        #ts_filename = os.path.join(ts_dir, f'segment_{segment_index:06d}.ts')
-                                        future = executor.submit(self.download_and_verify_ts_segment, ts_url, ts_filename, headers, segment_index)
+                                        # 生成标准文件名
+                                        standard_filename = generate_standard_filename('video', self.content_id, 'fetch',
+                                                                                       '.ts',
+                                                                                       segment_index=segment_index)
+                                        # 保存映射关系
+                                        ts_mapping[original_filename] = standard_filename
+
+                                        # 使用标准文件名保存ts文件
+                                        ts_filename = os.path.join(ts_dir, standard_filename)
+                                        future = executor.submit(self.download_and_verify_ts_segment, ts_url, ts_filename,
+                                                                 headers, segment_index)
                                         futures.append((ts_info, future))
 
                                 # 等待所有下载完成
-                                for ts_info, future in futures:
+                                for ts_info, future in futures[:]:
                                     try:
                                         if future.result():
                                             success_ts.append(ts_info)
@@ -1195,6 +1498,21 @@ class M3U8Downloader:
                                     except Exception as e:
                                         self.logger.error(f"重新下载ts片段时出错: {str(e)}")
 
+
+                                # 保存ts文件名映射
+                                mapping_file = os.path.join(video_dir, 'ts_mapping.json')
+                                # 读取现有的映射
+                                existing_mapping = {}
+                                if os.path.exists(mapping_file):
+                                    with open(mapping_file, 'r', encoding='utf-8') as f:
+                                        existing_mapping = json.load(f)
+
+                                # 更新映射
+                                existing_mapping.update(ts_mapping)
+                                with open(mapping_file, 'w', encoding='utf-8') as f:
+                                    json.dump(existing_mapping, f, ensure_ascii=False, indent=2)
+                                self.logger.info(f"已更新ts文件名映射到: {mapping_file}")
+
                             # 更新失败的ts片段列表
                             failed_m3u8['failed_ts_segments'] = [ts for ts in failed_ts_segments if
                                                                  ts not in success_ts]
@@ -1203,42 +1521,25 @@ class M3U8Downloader:
                             if not failed_m3u8['failed_ts_segments']:
                                 record['failed_m3u8'] = None
                                 self.logger.info("所有ts片段下载成功")
-                                self.logger.info(f"成功重新下载m3u8: {url}")
+                                self.logger.info(f"成功重新下载m3u8的ts片段: {url}")
 
-                                # 获取ts目录下的所有ts文件
-                                ts_files = [f for f in os.listdir(ts_dir) if f.endswith('.ts')]
-                                # 按文件名排序
-                                ts_files.sort()
+                                # 在videos目录中查找m3u8文件
+                                self.logger.info(f"0,{video_dir}")
+                                m3u8_files = [f for f in os.listdir(video_dir) if f.endswith('.m3u8') and "local" in f]
+                                #self.logger.info("1",m3u8_files)
 
-                                # 修改m3u8文件以支持本地播放
-                                m3u8_filename = os.path.join(video_dir, 'playlist.m3u8')
+                                if not m3u8_files:
+                                    self.logger.error(f"在目录 {video_dir} 中找不到m3u8文件")
+                                    continue
+                                #print("m3u8_files", m3u8_files)
+                                self.logger.info(f"m3u8_filename,{m3u8_files}")
+                                m3u8_filename = os.path.join(video_dir, m3u8_files[0])
+
+
                                 if os.path.exists(m3u8_filename):
-                                    new_m3u8_filename = os.path.join(video_dir, 'playlist_local.m3u8')
 
-                                    with open(m3u8_filename, 'r', encoding='utf-8') as f:
-                                        m3u8_content = f.readlines()
-
-                                    # 创建新的m3u8内容
-                                    new_m3u8_content = []
-                                    for line in m3u8_content:
-                                        if line.strip().endswith('.ts'):
-                                            # 找到对应的ts文件
-                                            ts_name = os.path.basename(line.strip())
-                                            if ts_name in ts_files:
-                                                # 使用相对路径指向本地ts文件
-                                                new_m3u8_content.append(f'ts/{ts_name}\n')
-                                            else:
-                                                # 如果本地没有对应的ts文件，保持原始URL
-                                                new_m3u8_content.append(line)
-                                        else:
-                                            # 保持其他行不变
-                                            new_m3u8_content.append(line)
-
-                                    # 写入新的m3u8文件
-                                    with open(new_m3u8_filename, 'w', encoding='utf-8') as f:
-                                        f.writelines(new_m3u8_content)
-
-                                    self.logger.info(f"已更新m3u8文件以支持本地播放: {new_m3u8_filename}")
+                                    self.modify_m3u8_for_local_playback(m3u8_filename, ts_dir, [ts_info['url'] for ts_info in failed_ts_segments],
+                                                                        ts_mapping = None, create_new_file = False)
                                 else:
                                     self.logger.error(f"找不到m3u8文件: {m3u8_filename}")
                             else:
@@ -1276,7 +1577,7 @@ class M3U8Downloader:
                     #print("2")
                     self.logger.info(f'所有下载失败的图片和视频都重新下载成功，更新{self.success_log_file}文件')
                     successful_download = {
-                        "content_id": content_id,
+                        "content_id": self.content_id,
                         "url": url,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                     }
@@ -1314,8 +1615,8 @@ def main():
     # parser_main()
 
     # 创建下载器实例
-    #downloader = M3U8Downloader('D:\\duanshu\\downloaded_media',"download_for_error_logs")
-    downloader = M3U8Downloader('D:\\duanshu\\downloaded_media')
+    downloader = M3U8Downloader('D:\\duanshu\\downloaded_media',"download_for_error_logs")
+    #downloader = M3U8Downloader('D:\\duanshu\\downloaded_media')
     # 处理文件
     start_time = time.time()
     file_path = 'liveroomlist_inc_vzan.csv'  # 替换为您的输入文件路径
