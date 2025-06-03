@@ -15,19 +15,19 @@ import concurrent.futures
 from pycparser.ply.yacc import token
 
 
-def generate_standard_filename(resource_type, liveroom_id, operation_type, extension, segment_index=None):
+def generate_standard_filename(resource_type, video_id, operation_type, extension, segment_index=None):
     """
     生成标准格式的文件名
 
     Args:
         resource_type (str): 资源类型 (video/cover/snapshot)
-        liveroom_id (str): 直播间ID，如果长度超过8位，将只取后8位
+        video_id (str): videoID，如果长度超过8位，将只取后8位
         operation_type (str): 操作类型 (upload/transcoded/fetch)
         extension (str): 文件扩展名
 
     Returns:
         str: 标准格式的文件名，格式为：
-            {resource_type}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}
+            {resource_type}_{video_id}_{operation_type}_{timestamp}_{extension}
 
     Note:
         - timestamp: ISO格式时间戳，格式为YYYYMMDDThhmmss，例如：20240328T153000
@@ -35,20 +35,19 @@ def generate_standard_filename(resource_type, liveroom_id, operation_type, exten
         - 如果生成的文件名超过255个字符，将自动截断并保留扩展名
     """
     # 处理resource_id，如果长度超过8位，只取后8位
-    if len(liveroom_id) > 8:
-        resource_id = liveroom_id[-8:]
+    #if len(video_id) > 8:
+    resource_id = video_id
 
     timestamp = time.strftime("%Y%m%dT%H%M%S")
     # 增加随机数长度到8位，确保唯一性
-    random_hash = str(uuid.uuid4()).replace('-', '')[:8]  # 去掉连字符后取前8位
 
     # 生成文件名
     if segment_index is not None and resource_type == 'video' and extension == '.ts':
         # ts文件使用新的命名格式
-        filename = f"segment_{segment_index:06d}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}"
+        filename = f"segment_{segment_index:06d}_{resource_id}_{operation_type}_{timestamp}{extension}"
     else:
         # 其他文件使用标准格式
-        filename = f"{resource_type}_{resource_id}_{operation_type}_{timestamp}_{random_hash}{extension}"
+        filename = f"{resource_type}_{resource_id}_{operation_type}_{timestamp}{extension}"
 
     # 如果文件名总长度超过255个字符（Windows文件系统限制），进行截断
     if len(filename) > 255:
@@ -1117,7 +1116,10 @@ class M3U8Downloader:
             #content_id = fields[0]  # 获取ID
             # 获取content_id并进行异常处理
             try:
-                self.content_id = fields[0]
+                random_hash = str(uuid.uuid4()).replace('-', '')[:4]  # 去掉连字符后取前4位
+                #content_id = 直播间id + 一个4位随机数
+                self.content_id = fields[0] + '_' + random_hash
+
                 if not self.content_id or not self.content_id.strip():
                     raise ValueError("content_id为空")
             except (IndexError, ValueError) as e:
@@ -1621,7 +1623,7 @@ def main():
     start_time = time.time()
     file_path = 'liveroomlist_inc_vzan.csv'  # 替换为您的输入文件路径
     #file_path = "liveroomlist_elements_inc_duanshu.csv"
-    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoiNiIsInJvbCI6IjIiLCJhaWQiOiI0OWU3YTk0ZC0xN2NkLTQ4NTUtYjAxNC0wMzFmMThjMmIzODkiLCJ1aWQiOiIyMjM4NTA1MDkiLCJsaWQiOiIxMTc0OTU0OSIsImFwcGlkIjoiMTgiLCJ0eXBlIjoiMCIsIm5iZiI6MTc0ODIyNjgyMSwiZXhwIjoxNzQ4MjcwMDUxLCJpYXQiOjE3NDgyMjY4NTEsImlzcyI6InZ6YW4iLCJhdWQiOiJ2emFuIn0.3hJZh2m3NjIrI3K2poqa_yYTn8ec4ha0xvk_XBwoCBc"
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ2IjoiNiIsInJvbCI6IjIiLCJhaWQiOiI0OWU3YTk0ZC0xN2NkLTQ4NTUtYjAxNC0wMzFmMThjMmIzODkiLCJ1aWQiOiIyMjM4NTA1MDkiLCJsaWQiOiIxMTc0OTU0OSIsImFwcGlkIjoiMTgiLCJ0eXBlIjoiMCIsIm5iZiI6MTc0ODk0MTgwOCwiZXhwIjoxNzQ4OTg1MDM4LCJpYXQiOjE3NDg5NDE4MzgsImlzcyI6InZ6YW4iLCJhdWQiOiJ2emFuIn0.SmAzvKTc863uvMJS8Ora6KSGtqRYYXt3tPWbsQbAAX4"
     #downloader.read_and_process_file(file_path, token)
     downloader.retry_failed_downloads(token)
     end_time = time.time()
