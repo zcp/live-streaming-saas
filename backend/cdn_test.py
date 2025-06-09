@@ -5,7 +5,7 @@ import time
 
 #VIDEO_URL = "https://lancet.im/videos/hls/playlist_local.m3u8"  # 你的 CDN 视频地址
 VIDEO_URL = "https://pub-8ea55317b8624238a35e5c73454b9d2d.r2.dev/videos/hls/playlist_local.m3u8" #非 cdn
-CONCURRENT_USERS = 10 # 并发用户数
+CONCURRENT_USERS = 20 # 并发用户数
 TEST_DURATION = 15     # 每个任务持续时间（秒）
 
 async def run_ffmpeg_test(index):
